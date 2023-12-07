@@ -2,6 +2,9 @@ package es.karmadev.api.netty.handler;
 
 import es.karmadev.api.channel.com.security.SecurityProvider;
 import es.karmadev.api.channel.data.BaseMessage;
+import es.karmadev.api.channel.subscription.event.NetworkEvent;
+import es.karmadev.api.channel.subscription.event.connection.PostConnectEvent;
+import es.karmadev.api.channel.subscription.event.data.direct.MessageReceiveEvent;
 import es.karmadev.api.netty.Client;
 import es.karmadev.api.netty.message.MessageBuilder;
 import es.karmadev.api.netty.message.nat.Messages;
@@ -67,7 +70,7 @@ public class ClientHandler extends ChannelInboundHandlerAdapter {
                 if (serverKey == null) {
                     serverKey = loadKey(key, algorithm);
                     if (serverKey != null) {
-                        client.getConnection().performKeyExchange(serverKey);
+                        client.performKeyExchange(serverKey);
                     }
                 }
             }
@@ -77,8 +80,12 @@ public class ClientHandler extends ChannelInboundHandlerAdapter {
                 Long encodedId = message.getInt64();
                 if (encodedId == null) return;
 
-                BaseMessage resolved = client.getConnection().resolve(encodedId, encodedData);
-                if (resolved != null) {
+                BaseMessage resolved = client.resolve(encodedId, encodedData);
+                if (resolved == null) return;
+
+                if (encodedId == Messages.KEY_EXCHANGE.getId()) {
+                    if (serverAlgo != null && serverSecret != null) return;
+
                     byte[] serverKey = resolved.getBytes();
                     String algorithm = resolved.getUTF();
                     if (algorithm == null) return;
@@ -87,11 +94,16 @@ public class ClientHandler extends ChannelInboundHandlerAdapter {
                     serverAlgo = algorithm;
 
                     client.setReady(true);
-                    for (BaseMessage que : client.getMessageQue()) {
-                        client.getConnection().write(que);
-                    }
-                    client.getMessageQue().clear();
+
+                    NetworkEvent event = new PostConnectEvent(client.getServer());
+                    client.handle(event);
+
+                    client.processQue((queMessage) -> client.getServer().write(queMessage));
+                    return;
                 }
+
+                NetworkEvent received = new MessageReceiveEvent(resolved);
+                client.handle(received);
             }
         }
     }

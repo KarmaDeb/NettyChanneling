@@ -16,7 +16,8 @@ public enum Messages {
     CHANNEL_MESSAGE(5),
     DISCOVER(6),
     //Encoded message, always contains only bytes
-    ENCODED(7);
+    ENCODED(7),
+    DISCONNECTION(8);
 
     private final long id;
 

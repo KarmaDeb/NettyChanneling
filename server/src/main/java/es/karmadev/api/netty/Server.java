@@ -1,12 +1,10 @@
 package es.karmadev.api.netty;
 
-import es.karmadev.api.channel.IServer;
+import es.karmadev.api.channel.com.Bridge;
+import es.karmadev.api.channel.com.remote.RemoteClient;
 import es.karmadev.api.channel.com.security.SecurityProvider;
 import es.karmadev.api.channel.data.BaseMessage;
-import es.karmadev.api.channel.future.Future;
-import es.karmadev.api.channel.subscription.AChannelSubscription;
-import es.karmadev.api.channel.subscription.event.NetworkEvent;
-import es.karmadev.api.netty.future.SimpleFuture;
+import es.karmadev.api.channel.subscription.event.data.server.MessageBroadcastEvent;
 import es.karmadev.api.netty.handler.DataDecoder;
 import es.karmadev.api.netty.handler.DataEncoder;
 import es.karmadev.api.netty.handler.ServerHandler;
@@ -22,29 +20,25 @@ import lombok.Getter;
 
 import javax.crypto.SecretKey;
 import java.io.IOException;
-import java.lang.invoke.MethodHandle;
-import java.lang.invoke.MethodHandles;
-import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
-import java.lang.reflect.Parameter;
 import java.net.*;
 import java.security.KeyPair;
 import java.util.*;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
 /**
  * Represents the netty server
  */
-public class Server implements IServer, Writeable {
+@SuppressWarnings("unused")
+public class Server extends SubscriberImpl implements es.karmadev.api.channel.Server, Writeable {
 
     private final EventLoopGroup bossGroup = new NioEventLoopGroup();
     private final EventLoopGroup workerGroup = new NioEventLoopGroup();
-    private final Map<Class<? extends NetworkEvent>, List<SubscriptionData>> subscriptions = new HashMap<>();
+    @Getter
+    private final Map<String, RemoteClient> connectedClients = new HashMap<>();
     private final List<VirtualChannel> channels = new ArrayList<>();
 
     private final SocketAddress address;
-    private final long id = ThreadLocalRandom.current().nextLong();
 
     private ServerChannel server;
 
@@ -127,7 +121,7 @@ public class Server implements IServer, Writeable {
      */
     @Override
     public long getId() {
-        return id;
+        return -1;
     }
 
     @Override
@@ -135,9 +129,31 @@ public class Server implements IServer, Writeable {
         return address;
     }
 
+    /**
+     * Get the server connected clients
+     *
+     * @return the server connected
+     * clients
+     */
+    @Override
+    public Collection<? extends RemoteClient> getClients() {
+        return Collections.unmodifiableCollection(connectedClients.values());
+    }
+
     @Override
     public Collection<VirtualChannel> getChannels() {
         return Collections.unmodifiableList(channels);
+    }
+
+    /**
+     * Get all the server bridges
+     *
+     * @return the server created
+     * bridges
+     */
+    @Override
+    public Collection<? extends Bridge> getBridges() {
+        return null;
     }
 
     @Override
@@ -149,101 +165,19 @@ public class Server implements IServer, Writeable {
     }
 
     /**
-     * Add a subscription to the client.
+     * Write a message to all the clients. Unlike the
+     * method {@link VirtualChannel#write(BaseMessage)} this
+     * method sends the message to all the clients directly
      *
-     * @param subscription the subscription to add
+     * @param message the message to send
      */
     @Override
-    public void subscribe(final AChannelSubscription subscription) {
-        Class<? extends AChannelSubscription> subClass = subscription.getClass();
+    public void broadcast(final BaseMessage message) {
+        MessageBroadcastEvent event = new MessageBroadcastEvent(message);
+        handle(event);
 
-        Map<Class<? extends NetworkEvent>, List<MethodHandle>> handleList = new HashMap<>();
-        for (Method method : subClass.getDeclaredMethods()) {
-            int modifiers = method.getModifiers();
-            if (!Modifier.isPublic(modifiers) || Modifier.isAbstract(modifiers) || Modifier.isStatic(modifiers)) continue;
-
-            Parameter[] parameters = method.getParameters();
-            if (parameters.length != 1) continue;
-
-            Parameter parameter = parameters[0];
-            Class<?> parameterType = parameter.getType();
-
-            if (!NetworkEvent.class.isAssignableFrom(parameterType)) continue;
-            Class<? extends NetworkEvent> eventClass = parameterType.asSubclass(NetworkEvent.class);
-
-            List<MethodHandle> handles = handleList.computeIfAbsent(eventClass, (l) -> new ArrayList<>());
-            MethodHandles.Lookup lookup = MethodHandles.lookup();
-
-            try {
-                MethodHandle handle = lookup.unreflect(method)
-                        .bindTo(subscription);
-                handles.add(handle);
-            } catch (IllegalAccessException ignored) {}
-        }
-
-        for (Class<? extends NetworkEvent> eventClass : handleList.keySet()) {
-            List<MethodHandle> handles = handleList.get(eventClass);
-
-            SubscriptionData data = SubscriptionData.of(subscription, handles);
-
-            List<SubscriptionData> dataList = this.subscriptions.computeIfAbsent(eventClass, (l) -> new ArrayList<>());
-            if (dataList.contains(data)) {
-                continue;
-            }
-
-            dataList.add(data);
-            this.subscriptions.put(eventClass, dataList);
-        }
-    }
-
-    /**
-     * Remove a subscriptor from the
-     * client
-     *
-     * @param subscription the subscription
-     */
-    @Override
-    public void unsubscribe(final AChannelSubscription subscription) {
-        for (Class<? extends NetworkEvent> eventClass : subscriptions.keySet()) {
-            List<SubscriptionData> dataList = this.subscriptions.computeIfAbsent(eventClass, (l) -> new ArrayList<>());
-            dataList.removeIf(data -> data.getHandler().equals(subscription));
-        }
-    }
-
-    /**
-     * Handle an event for the client
-     *
-     * @param event the event to handle
-     */
-    @Override
-    public void handle(final NetworkEvent event) {
-        List<SubscriptionData> data = this.subscriptions.get(event.getClass());
-        if (data == null || data.isEmpty()) return;
-
-        for (SubscriptionData subscription : data) {
-            List<MethodHandle> handles = subscription.getInvokers();
-            for (MethodHandle handle : handles) {
-                try {
-                    handle.invokeWithArguments(event);
-                } catch (Throwable ex) {
-                    throw new RuntimeException(ex);
-                }
-            }
-        }
-    }
-
-    @Override
-    public void write(final BaseMessage message) {
-        MessageBuilder idContainer = new MessageBuilder();
-        idContainer.writeInt64(id);
-
-        try {
-            BaseMessage idHolder = idContainer.build(message.getId());
-            BaseMessage merged = MessageBuilder.insertBefore(message, idHolder);
-            server.writeAndFlush(merged);
-        } catch (IOException ex) {
-            throw new RuntimeException(ex);
-        }
+        if (event.isCancelled()) return;
+        server.writeAndFlush(message);
     }
 
     @Override
@@ -252,12 +186,11 @@ public class Server implements IServer, Writeable {
     }
 
     @Override
-    public Future start() {
-        SimpleFuture task = new SimpleFuture();
+    public CompletableFuture<Boolean> start() {
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
 
         if (server != null && server.isOpen()) {
-            task.complete(true, null);
-            return task;
+            return CompletableFuture.completedFuture(true);
         }
 
         ServerBootstrap bootstrap = new ServerBootstrap();
@@ -316,14 +249,13 @@ public class Server implements IServer, Writeable {
         bootstrap.bind(address).addListener((ChannelFutureListener) channelFuture -> {
             if (channelFuture.isSuccess()) {
                 this.server = (ServerChannel) channelFuture.channel();
-                task.complete(this.server.isOpen(), null);
+                future.complete(this.server.isOpen());
             } else {
-                Throwable error = channelFuture.cause();
-                task.complete(false, error);
+                future.completeExceptionally(channelFuture.cause());
             }
         });
 
-        return task;
+        return future;
     }
 
     public void stop() {
@@ -347,7 +279,7 @@ public class Server implements IServer, Writeable {
      */
     @Override
     public void push(final BaseMessage message) {
-        write(message);
+        broadcast(message);
     }
 
     /**
@@ -378,7 +310,7 @@ public class Server implements IServer, Writeable {
      */
     @Override
     public void addToQue(final BaseMessage message) {
-        write(message);
+        broadcast(message);
     }
 
     /**

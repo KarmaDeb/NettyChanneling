@@ -1,14 +1,18 @@
 package es.karmadev.api.netty.handler;
 
+import es.karmadev.api.channel.com.remote.RemoteClient;
 import es.karmadev.api.channel.com.security.SecurityProvider;
 import es.karmadev.api.channel.data.BaseMessage;
 import es.karmadev.api.channel.subscription.event.NetworkEvent;
-import es.karmadev.api.channel.subscription.event.data.MessageReceiveEvent;
+import es.karmadev.api.channel.subscription.event.connection.server.ClientConnectedEvent;
+import es.karmadev.api.channel.subscription.event.connection.server.ClientPreConnectEvent;
+import es.karmadev.api.channel.subscription.event.data.server.direct.DirectMessageEvent;
 import es.karmadev.api.netty.Server;
 import es.karmadev.api.netty.message.DecMessage;
 import es.karmadev.api.netty.message.MessageBuilder;
 import es.karmadev.api.netty.message.nat.Messages;
 import es.karmadev.api.netty.secure.SecureGen;
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 
@@ -27,6 +31,8 @@ public class ServerHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void channelRead(final ChannelHandlerContext ctx, final Object msg) throws Exception {
+        Channel channel = ctx.channel();
+
         if (msg instanceof BaseMessage) {
             BaseMessage message = (BaseMessage) msg;
             long id = message.getId();
@@ -35,6 +41,9 @@ public class ServerHandler extends ChannelInboundHandlerAdapter {
             if (type == null) return;
 
             if (type.equals(Messages.KEY_EXCHANGE)) {
+                Long connectionId = message.getInt64();
+                if (connectionId == null) return;
+
                 byte[] encodedSecret = message.getBytes();
                 String algorithm = message.getUTF();
 
@@ -45,15 +54,24 @@ public class ServerHandler extends ChannelInboundHandlerAdapter {
                 SecretKey decrypted = decryptSecret(encodedSecret, algorithm, serverPrivate);
                 SecretKey serverSecret = server.getSecret();
 
-                server.mapKey(ctx.channel(), decrypted, algorithm);
+                server.mapKey(channel, decrypted, algorithm);
 
                 MessageBuilder builder = new MessageBuilder();
                 builder.writeUTF(SecureGen.SECRET_ALGORITHM);
                 builder.write(serverSecret.getEncoded());
 
-                ctx.channel().writeAndFlush(builder.build(Messages.KEY_EXCHANGE));
+                channel.writeAndFlush(builder.build(Messages.KEY_EXCHANGE));
+
+                RemoteClient rm = new es.karmadev.api.netty.RemoteClient(connectionId, server, channel);
+                rm.getProperties().put("id", channel.id().asShortText());
+
+                server.getConnectedClients().put(channel.id().asLongText(), rm);
             }
+
             if (type.equals(Messages.ENCODED)) {
+                RemoteClient rm = server.getConnectedClients().get(channel.id().asLongText());
+                if (rm == null) return; //Unsafe communication
+
                 Long originalId = message.getInt64();
                 if (originalId == null) return;
                 byte[] encodedData = message.getBytes();
@@ -61,15 +79,49 @@ public class ServerHandler extends ChannelInboundHandlerAdapter {
                                 .decodeData(encodedData, server.getSecret());
 
                 DecMessage decoded = new DecMessage(originalId, decodedData);
-                NetworkEvent event = new MessageReceiveEvent(decoded);
+                DirectMessageEvent event = new DirectMessageEvent(rm, decoded);
 
                 server.handle(event);
+
+                if (event.isCancelled()) {
+                    //TODO: Discard message
+                }
+                //TODO: Forward message (if needed)
             }
 
             return;
         }
 
         super.channelRead(ctx, msg);
+    }
+
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) throws Exception {
+        NetworkEvent event = new ClientPreConnectEvent(ctx.channel().remoteAddress());
+        server.handle(event);
+
+        super.channelActive(ctx);
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        Channel channel = ctx.channel();
+        RemoteClient rm = server.getConnectedClients().get(channel.id().asLongText());
+        if (rm == null) {
+            super.channelInactive(ctx);
+            return;
+        }; //Unsafe communication
+
+        NetworkEvent event = new ClientConnectedEvent(rm);
+        server.handle(event);
+
+        server.getConnectedClients().remove(channel.id().asLongText());
+        super.channelInactive(ctx);
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        super.exceptionCaught(ctx, cause);
     }
 
     private SecretKey decryptSecret(final byte[] data, final String algorithm, final PrivateKey key) {
