@@ -1,5 +1,24 @@
 package es.karmadev.api.netty;
 
+/*
+ * Copyright 2023 KarmaDev
+ *
+ * This file is part of NettyChanneling.
+ *
+ * NettyChanneling is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * NettyChanneling is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with NettyChanneling. If not, see <http://www.gnu.org/licenses/>.
+ */
+
 import es.karmadev.api.channel.com.Bridge;
 import es.karmadev.api.channel.com.remote.RemoteClient;
 import es.karmadev.api.channel.com.security.SecurityProvider;
@@ -17,26 +36,32 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import lombok.Getter;
+import org.jetbrains.annotations.Nullable;
 
+import javax.annotation.concurrent.ThreadSafe;
 import javax.crypto.SecretKey;
 import java.io.IOException;
 import java.net.*;
 import java.security.KeyPair;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 /**
  * Represents the netty server
  */
 @SuppressWarnings("unused")
+@ThreadSafe
 public class Server extends SubscriberImpl implements es.karmadev.api.channel.Server, Writeable {
 
     private final EventLoopGroup bossGroup = new NioEventLoopGroup();
     private final EventLoopGroup workerGroup = new NioEventLoopGroup();
     @Getter
-    private final Map<String, RemoteClient> connectedClients = new HashMap<>();
-    private final List<VirtualChannel> channels = new ArrayList<>();
+    private final Map<String, RemoteClient> connectedClients = new ConcurrentHashMap<>();
+    private final Queue<VirtualChannel> channels = new ArrayDeque<>();
+    private final AtomicBoolean starting = new AtomicBoolean(false);
 
     private final SocketAddress address;
 
@@ -47,10 +72,13 @@ public class Server extends SubscriberImpl implements es.karmadev.api.channel.Se
     @Getter
     private final SecretKey secret;
 
+    @Getter
+    private byte[] accessKey;
+
     private final byte[] encoded;
 
-    private final Map<String, SecretKey> keyMap = new HashMap<>();
-    private final Map<String, String> keyAlgoMap = new HashMap<>();
+    private final Map<String, SecretKey> keyMap = new ConcurrentHashMap<>();
+    private final Map<String, String> keyAlgoMap = new ConcurrentHashMap<>();
 
     public Server() throws SocketException {
         this(findAddress(4653));
@@ -115,6 +143,29 @@ public class Server extends SubscriberImpl implements es.karmadev.api.channel.Se
     }
 
     /**
+     * Set the server access key. When set to anything
+     * not null, the client will need to provide this key
+     * after a successful key exchange in order to complete
+     * the connection
+     *
+     * @param key the key
+     */
+    public void setKey(final String key) {
+        if (this.server != null && server.isOpen()) return;
+        if (key == null) {
+            this.accessKey = null;
+            return;
+        }
+
+        /*
+        Never store the access key in raw text, we will
+        decrypt later when verifying the key
+         */
+        this.accessKey = SecureGen.SECRET_PROVIDER
+                .encodeData(key.getBytes(), secret);
+    }
+
+    /**
      * Get the server ID
      *
      * @return the server ID
@@ -142,7 +193,19 @@ public class Server extends SubscriberImpl implements es.karmadev.api.channel.Se
 
     @Override
     public Collection<VirtualChannel> getChannels() {
-        return Collections.unmodifiableList(channels);
+        return Collections.unmodifiableCollection(channels);
+    }
+
+    /**
+     * Get an existing channel
+     *
+     * @param name the channel name
+     * @return the channel
+     */
+    @Override
+    public @Nullable VirtualChannel getChannel(final String name) {
+        return channels.stream().filter((ch) -> ch.getName().equalsIgnoreCase(name))
+                .findAny().orElse(null);
     }
 
     /**
@@ -192,6 +255,9 @@ public class Server extends SubscriberImpl implements es.karmadev.api.channel.Se
         if (server != null && server.isOpen()) {
             return CompletableFuture.completedFuture(true);
         }
+
+        if (starting.get()) throw new RuntimeException("Already starting server!");
+        starting.set(true);
 
         ServerBootstrap bootstrap = new ServerBootstrap();
         bootstrap.group(bossGroup, workerGroup)

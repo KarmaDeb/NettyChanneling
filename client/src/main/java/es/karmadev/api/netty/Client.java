@@ -1,6 +1,24 @@
 package es.karmadev.api.netty;
 
-import es.karmadev.api.channel.com.remote.RemoteServer;
+/*
+ * Copyright 2023 KarmaDev
+ *
+ * This file is part of NettyChanneling.
+ *
+ * NettyChanneling is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * NettyChanneling is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with NettyChanneling. If not, see <http://www.gnu.org/licenses/>.
+ */
+
 import es.karmadev.api.channel.data.BaseMessage;
 import es.karmadev.api.channel.subscription.event.NetworkEvent;
 import es.karmadev.api.channel.subscription.event.connection.PreConnectEvent;
@@ -20,6 +38,7 @@ import lombok.Getter;
 import lombok.Setter;
 import org.jetbrains.annotations.Nullable;
 
+import javax.annotation.concurrent.ThreadSafe;
 import javax.crypto.SecretKey;
 import java.io.IOException;
 import java.net.SocketAddress;
@@ -27,16 +46,19 @@ import java.security.PublicKey;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.zip.DataFormatException;
 
 /**
  * Represents a netty client
  */
+@ThreadSafe
 public class Client extends SubscriberImpl implements es.karmadev.api.channel.Client, Writeable {
 
     private final EventLoopGroup workGroup = new NioEventLoopGroup();
     private final long id = ThreadLocalRandom.current().nextLong();
+    private final AtomicBoolean connecting = new AtomicBoolean(false);
 
     private boolean bridgeSupport = false;
     private Channel channel;
@@ -45,10 +67,9 @@ public class Client extends SubscriberImpl implements es.karmadev.api.channel.Cl
     @Setter
     private boolean ready;
     @Getter
-    private final List<BaseMessage> messageQue = new ArrayList<>();
+    private final Queue<BaseMessage> messageQue = new ArrayDeque<>();
 
     private SecretKey secret;
-
     private Thread shutdownHook;
 
     /**
@@ -81,6 +102,35 @@ public class Client extends SubscriberImpl implements es.karmadev.api.channel.Cl
      */
     @Override
     public CompletableFuture<RemoteServer> connect(final SocketAddress address, final boolean bridge) {
+        return connect(address, bridge, null);
+    }
+
+    /**
+     * Request the client to encode the
+     * specified bytes using its secret
+     *
+     * @param data the data to encode
+     * @return the encoded data
+     */
+    public byte[] encode(final byte[] data) {
+        return SecureGen.SECRET_PROVIDER
+                .encodeData(data, secret);
+    }
+
+    /**
+     * Connect the client to a server
+     *
+     * @param address the server address
+     * @param bridge  if the connection supports
+     *                bridging
+     * @param key the access key
+     * @return the connection task
+     */
+    public CompletableFuture<RemoteServer> connect(final SocketAddress address, final boolean bridge, final String key) {
+        if (server != null && channel.isOpen()) throw new RuntimeException("Already connected!");
+        if (connecting.get()) throw new RuntimeException("Already trying to connect");
+        connecting.set(true);
+
         CompletableFuture<RemoteServer> future = new CompletableFuture<>();
 
         Properties properties = new Properties();
@@ -101,7 +151,7 @@ public class Client extends SubscriberImpl implements es.karmadev.api.channel.Cl
         bootstrap.handler(new ChannelInitializer<SocketChannel>() {
             @Override
             protected void initChannel(SocketChannel ch) {
-                ClientHandler handler = new ClientHandler(Client.this);
+                ClientHandler handler = new ClientHandler(Client.this, key);
                 DataEncoder encoder = new DataEncoder(((message, channel) -> {
                     try {
                         return handler.encode(message);
@@ -122,7 +172,7 @@ public class Client extends SubscriberImpl implements es.karmadev.api.channel.Cl
         bootstrap.connect(address).addListener((ChannelFutureListener) channelFuture -> {
             if (channelFuture.isSuccess()) {
                 this.channel = channelFuture.channel();
-                server = new es.karmadev.api.netty.RemoteServer(address, Client.this, channel);
+                server = new RemoteServer(address, Client.this, channel);
 
                 if (shutdownHook != null) {
                     Runtime.getRuntime().removeShutdownHook(shutdownHook);
@@ -220,6 +270,8 @@ public class Client extends SubscriberImpl implements es.karmadev.api.channel.Cl
      */
     @Override
     public void close() {
+        connecting.set(false);
+
         if (shutdownHook != null)
             Runtime.getRuntime().removeShutdownHook(shutdownHook);
 
@@ -269,6 +321,7 @@ public class Client extends SubscriberImpl implements es.karmadev.api.channel.Cl
             byte[] resolved = SecureGen.SECRET_PROVIDER
                     .decodeData(encodedData, secret);
 
+            System.out.println("Reading: " + Arrays.toString(resolved));
             return new DecMessage(id, resolved);
         } catch (IOException | DataFormatException ex) {
             throw new RuntimeException(ex);

@@ -1,41 +1,71 @@
 package es.karmadev.api.netty;
 
-import es.karmadev.api.channel.VirtualChannel;
+/*
+ * Copyright 2023 KarmaDev
+ *
+ * This file is part of NettyChanneling.
+ *
+ * NettyChanneling is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * NettyChanneling is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with NettyChanneling. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+import es.karmadev.api.array.set.ConcurrentWatchdogSet;
 import es.karmadev.api.channel.com.Bridge;
 import es.karmadev.api.channel.data.BaseMessage;
-import es.karmadev.api.channel.subscription.event.NetworkEvent;
 import es.karmadev.api.channel.subscription.event.data.direct.MessageEmitEvent;
 import es.karmadev.api.netty.message.MessageBuilder;
 import es.karmadev.api.netty.message.nat.Messages;
 import io.netty.channel.Channel;
 import lombok.AllArgsConstructor;
+import lombok.Getter;
 import org.jetbrains.annotations.Nullable;
 
-import javax.annotation.concurrent.NotThreadSafe;
+import javax.annotation.concurrent.ThreadSafe;
 import java.io.IOException;
 import java.net.SocketAddress;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 /**
- * Represents a remote
- * server. Please note the remote server
- * is not guaranteed to be thread safe. The
- * channel iterations should be made on a single
- * thread
+ * Represents a remote server
  */
 @AllArgsConstructor
-@NotThreadSafe
+@ThreadSafe
 public class RemoteServer implements es.karmadev.api.channel.com.remote.RemoteServer {
 
     private final SocketAddress address;
     private final Client client;
     private final Channel channel;
 
-    private final Set<VirtualChannel> channels = new HashSet<>();
+    @Getter
+    private final ConcurrentWatchdogSet<VirtualChannel> joinedChannels = new ConcurrentWatchdogSet<>();
+    @Getter
+    private final Set<String> joinAbleChannels = ConcurrentHashMap.newKeySet();
+
+    private final Map<String, Consumer<VirtualChannel>> joinListeners = new ConcurrentHashMap<>();
+
+    {
+        joinedChannels.onAdd((channel) -> {
+            String name = channel.getName();
+            Consumer<VirtualChannel> consumer = joinListeners.remove(name);
+            if (consumer == null) return false;
+
+            consumer.accept(channel);
+            return true;
+        });
+    }
 
     /**
      * Get the server address
@@ -48,6 +78,17 @@ public class RemoteServer implements es.karmadev.api.channel.com.remote.RemoteSe
     }
 
     /**
+     * Get a list of all the server available
+     * channels
+     *
+     * @return the server available channels
+     */
+    @Override
+    public Collection<String> getAvailableChannels() {
+        return Collections.unmodifiableSet(joinAbleChannels);
+    }
+
+    /**
      * Get all the channels the client
      * is currently connected to
      *
@@ -55,8 +96,8 @@ public class RemoteServer implements es.karmadev.api.channel.com.remote.RemoteSe
      * is connected to
      */
     @Override
-    public Collection<? extends VirtualChannel> getChannels() {
-        return Collections.unmodifiableSet(channels);
+    public Collection<VirtualChannel> getChannels() {
+        return Collections.unmodifiableSet(joinedChannels);
     }
 
     /**
@@ -68,7 +109,7 @@ public class RemoteServer implements es.karmadev.api.channel.com.remote.RemoteSe
      */
     @Override
     public @Nullable VirtualChannel getChannel(final String channel) {
-        return channels.stream().filter((ch) -> ch.getName().equalsIgnoreCase(channel))
+        return joinedChannels.stream().filter((ch) -> ch.getName().equalsIgnoreCase(channel))
                 .findAny().orElse(null);
     }
 
@@ -80,11 +121,25 @@ public class RemoteServer implements es.karmadev.api.channel.com.remote.RemoteSe
      */
     @Override
     public CompletableFuture<VirtualChannel> joinChannel(final String channel) {
+        if (joinListeners.containsKey(channel)) throw new RuntimeException("Already trying to join channel");
+
         VirtualChannel joined = getChannel(channel);
         if (joined != null) return CompletableFuture.completedFuture(joined);
 
-        //TODO: Channel join logic
-        return null;
+        CompletableFuture<VirtualChannel> future = new CompletableFuture<>();
+        joinListeners.put(channel, future::complete);
+
+        try {
+            MessageBuilder builder = new MessageBuilder();
+            builder.writeUTF(channel);
+
+            BaseMessage message = builder.build(Messages.CHANNEL_JOIN);
+            this.channel.writeAndFlush(message);
+        } catch (IOException ex) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        return future;
     }
 
     /**

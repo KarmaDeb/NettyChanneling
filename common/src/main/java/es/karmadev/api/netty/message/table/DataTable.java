@@ -1,5 +1,24 @@
 package es.karmadev.api.netty.message.table;
 
+/*
+ * Copyright 2023 KarmaDev
+ *
+ * This file is part of NettyChanneling.
+ *
+ * NettyChanneling is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * NettyChanneling is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with NettyChanneling. If not, see <http://www.gnu.org/licenses/>.
+ */
+
 import es.karmadev.api.netty.message.table.entry.TableEntry;
 
 import java.nio.ByteBuffer;
@@ -117,6 +136,15 @@ public class DataTable implements Cloneable {
 
         int index = 0;
         for (TableEntry entry : entries) {
+            if (entry == null) continue;
+            if (entry.getType() == null) {
+                System.out.println("[WARN] Found invalid entry type at index " + index);
+                continue;
+            }
+
+            byte[] raw = entry.wrap();
+            byte[] wrapped = Arrays.copyOfRange(raw, 8, raw.length);
+
             builder.append("\t{")
                     .append("\n\t\tdataType=")
                     .append(entry.getType().name())
@@ -125,7 +153,7 @@ public class DataTable implements Cloneable {
                     .append("\n\t\ttoRange=")
                     .append(entry.getDestination())
                     .append("\n\t\t[@\n\t\t\t")
-                    .append(Arrays.toString(entry.wrap()))
+                    .append(Arrays.toString(wrapped))
                     .append("\n\t\t]\n\t}");
 
             if (++index != entries.size()) {
@@ -149,6 +177,7 @@ public class DataTable implements Cloneable {
         List<TableEntry> entries = new ArrayList<>();
         for (int i = 0; i < table.length; i += 9) {
             byte dataType = table[i];
+
             ByteBuffer originAllocator = ByteBuffer.allocate(4);
             ByteBuffer destAllocator = ByteBuffer.allocate(4);
 
